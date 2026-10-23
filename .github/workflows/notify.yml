@@ -1,0 +1,176 @@
+# Reusable workflow: sends a release announcement to Telegram.
+#
+# Two modes:
+#   - notes: the caller passes the release notes (Markdown, e.g. a CHANGELOG
+#     section) and optionally a link (a website that was just deployed);
+#   - release_tag: the workflow reads the GitHub Release of the caller's repo
+#     (title, notes) and sends the assets that match asset_pattern as files.
+#
+# Secrets (from the caller, `secrets: inherit`): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
+name: Notify release
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Project name shown in the message
+        required: true
+        type: string
+      version:
+        description: Version, e.g. 0.4.1 (defaults to the release tag)
+        required: false
+        type: string
+        default: ''
+      notes:
+        description: Release notes in Markdown (web mode)
+        required: false
+        type: string
+        default: ''
+      url:
+        description: Link added to the message (e.g. the deployed site)
+        required: false
+        type: string
+        default: ''
+      release_tag:
+        description: Tag of a GitHub Release in the caller repo (release mode)
+        required: false
+        type: string
+        default: ''
+      asset_pattern:
+        description: Glob for release assets to send as files
+        required: false
+        type: string
+        default: '*.apk'
+    secrets:
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Collect notes and files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+          PATTERN: ${{ inputs.asset_pattern }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/notify"
+          mkdir -p "$out/files"
+          if [[ -n "$TAG" ]]; then
+            gh release view "$TAG" --repo "$REPO" --json body,url --jq .body > "$out/notes.md"
+            gh release view "$TAG" --repo "$REPO" --json url --jq .url > "$out/release_url"
+            gh release download "$TAG" --repo "$REPO" --pattern "$PATTERN" --dir "$out/files" || echo "::warning::No assets matching $PATTERN"
+          else
+            printf '%s\n' "$NOTES" > "$out/notes.md"
+            : > "$out/release_url"
+          fi
+          ls -la "$out/files"
+
+      - name: Send to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROJECT: ${{ inputs.project }}
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.release_tag }}
+          URL: ${{ inputs.url }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set, skipping"
+            exit 0
+          fi
+          out="$RUNNER_TEMP/notify"
+          version="${VERSION:-${TAG#v}}"
+          python3 - "$out" "$PROJECT" "$version" "$URL" <<'PY'
+          import html, re, sys, pathlib
+          out, project, version, url = sys.argv[1:5]
+          out = pathlib.Path(out)
+          notes = (out / "notes.md").read_text(encoding="utf-8").strip()
+          release_url = (out / "release_url").read_text(encoding="utf-8").strip()
+
+          def inline(s):
+              s = html.escape(s, quote=False)
+              s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+              s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+              s = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<a href="\2">\1</a>', s)
+              return s
+
+          lines = []
+          for raw in notes.splitlines():
+              line = raw.rstrip()
+              if not line.strip() or line.strip() == "---":
+                  if lines and lines[-1] != "":
+                      lines.append("")
+                  continue
+              m = re.match(r"^#{1,6}\s+(.*)$", line)
+              if m:
+                  lines.append(f"<b>{inline(m.group(1))}</b>")
+                  continue
+              m = re.match(r"^(\s*)[-*]\s+(.*)$", line)
+              if m:
+                  indent = "  " * (len(m.group(1)) // 2)
+                  lines.append(f"{indent}• {inline(m.group(2))}")
+                  continue
+              lines.append(inline(line))
+          body = "\n".join(lines).strip()
+
+          title = f"🚀 <b>{html.escape(project)}</b>"
+          if version:
+              title += f" {html.escape(version)}"
+          footer = []
+          if url:
+              footer.append(f'<a href="{html.escape(url)}">Открыть</a>')
+          if release_url:
+              footer.append(f'<a href="{html.escape(release_url)}">Релиз на GitHub</a>')
+          tail = ("\n\n" + " · ".join(footer)) if footer else ""
+          limit = 4096 - len(title) - len(tail) - 4
+          if len(body) > limit:
+              cut = body[:limit].rsplit("\n", 1)[0]
+              body = cut + "\n…"
+          text = title + ("\n\n" + body if body else "") + tail
+          (out / "message.html").write_text(text, encoding="utf-8")
+          (out / "caption.txt").write_text(f"{project} {version}".strip(), encoding="utf-8")
+          PY
+
+          api="https://api.telegram.org/bot${BOT_TOKEN}"
+          send() {
+            # Telegram answers {"ok":false,...} with HTTP 4xx; fail the step on errors
+            # but never print the token.
+            local resp
+            resp="$(curl -sS "$@")" || { echo "::error::Telegram request failed"; exit 1; }
+            if ! grep -q '"ok":true' <<<"$resp"; then
+              echo "::error::Telegram error: $(sed -E 's/bot[0-9]+:[A-Za-z0-9_-]+/bot***/g' <<<"$resp")"
+              exit 1
+            fi
+          }
+
+          shopt -s nullglob
+          for f in "$out"/files/*; do
+            size=$(stat -c %s "$f")
+            if (( size > 50 * 1024 * 1024 )); then
+              echo "::warning::$(basename "$f") is larger than 50 MB, Telegram bots cannot send it"
+              continue
+            fi
+            send -X POST "$api/sendDocument" \
+              -F chat_id="$CHAT_ID" \
+              -F document=@"$f" \
+              -F caption="$(cat "$out/caption.txt")"
+          done
+
+          send -X POST "$api/sendMessage" \
+            --data-urlencode chat_id="$CHAT_ID" \
+            --data-urlencode parse_mode=HTML \
+            --data-urlencode disable_web_page_preview=true \
+            --data-urlencode text@"$out/message.html"
+          echo "Sent to Telegram"
